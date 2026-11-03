@@ -1,0 +1,641 @@
+--- /dev/null
++++ b/code/samples/python/tests/payment_processor_unknown_outcome_tests.py
+@@ -0,0 +1,638 @@
++"""Seven offline signed-chain controls for unknown AP2 checkout outcomes.
++
++These tests exercise actual SDK verification, constraints, SQLite reservations
++and signed receipt creation. Merchant completion is a local used-token handoff;
++receipt delivery is local or deliberately lost. No payment network is used.
++Checkout re-signing characterizes hash identity; it is not a same-hash bypass.
++"""
++
++import asyncio
++import contextvars
++import json
++import logging
++import os
++import socket
++import sqlite3
++import subprocess
++import sys
++import threading
++import time
++
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from jwcrypto.jwk import JWK
++
++
++ATTEMPT = contextvars.ContextVar('attempt', default='setup')
++
++
++def load_api():
++    # Deliberately after the fixture sets test-owned import-time directories.
++    from ap2.sdk import mandate as mandate_module
++    from ap2.sdk.generated.open_checkout_mandate import OpenCheckoutMandate
++    from ap2.sdk.generated.open_payment_mandate import (
++        AmountRange,
++        OpenPaymentMandate,
++        PaymentReference,
++    )
++    from ap2.sdk.generated.payment_mandate import PaymentMandate
++    from ap2.sdk.generated.types.checkout import Checkout
++    from ap2.sdk.jwt_helper import create_jwt, verify_jwt
++    from ap2.sdk.mandate import MandateClient
++    from ap2.sdk.payment_mandate_chain import PaymentMandateChain
++    from ap2.sdk.receipt_wrapper import ReceiptClient
++    from ap2.sdk.sdjwt import compute_sd_hash, parse_token
++    from ap2.sdk.utils import compute_sha256_b64url
++    from roles.credentials_provider_mcp import server as cp
++    from roles.merchant_payment_processor_mcp import server as mpp
++
++    return SimpleNamespace(
++        mandate_module=mandate_module,
++        OpenCheckoutMandate=OpenCheckoutMandate,
++        AmountRange=AmountRange,
++        OpenPaymentMandate=OpenPaymentMandate,
++        PaymentReference=PaymentReference,
++        PaymentMandate=PaymentMandate,
++        Checkout=Checkout,
++        create_jwt=create_jwt,
++        verify_jwt=verify_jwt,
++        MandateClient=MandateClient,
++        PaymentMandateChain=PaymentMandateChain,
++        ReceiptClient=ReceiptClient,
++        compute_sd_hash=compute_sd_hash,
++        parse_token=parse_token,
++        compute_sha256_b64url=compute_sha256_b64url,
++        cp=cp,
++        mpp=mpp,
++    )
++
++
++def offline_connect(original, sock, address):
++    if sock.family in (socket.AF_INET, socket.AF_INET6):
++        raise AssertionError(
++            'External network forbidden in offline AP2 control'
++        )
++    return original(sock, address)
++
++
++def key(kid):
++    return JWK.generate(kty='EC', crv='P-256', kid=kid)
++
++
++def rows(path):
++    with sqlite3.connect(path) as db:
++        return db.execute(
++            'SELECT reservation_key FROM reservations ORDER BY reservation_key'
++        ).fetchall()
++
++
++class Rig:
++    def __init__(self, monkeypatch, directory, api):
++        self.api = api
++        self.directory = directory
++        self.trace = []
++        self.receipts = []
++        self.delivered = []
++        self.lock = threading.Lock()
++        self.lose_delivery = False
++        self.user = key('offline-authority')
++        self.agent = key('offline-delegate')
++        self.merchant = key('offline-merchant')
++        self.processor = key('merchant-payment-processor-key-1')
++        self.tokens = directory / 'tokens.json'
++        self.mandates = directory / 'mandates.sqlite3'
++        self.transactions = directory / 'transactions.sqlite3'
++        self.open_checkout = self.api.MandateClient().create(
++            [
++                self.api.OpenCheckoutMandate(
++                    constraints=[],
++                    cnf={'jwk': json.loads(self.agent.export_public())},
++                )
++            ],
++            issuer_key=self.user,
++        )
++        self.open_hash = self.api.compute_sd_hash(
++            self.api.parse_token(self.open_checkout)
++        )
++        public = directory / 'authority.pub'
++        public.write_text(self.user.export_public())
++        processor_key = directory / 'processor-key.json'
++        processor_key.write_text(self.processor.export_private())
++        for module in (self.api.cp, self.api.mpp):
++            monkeypatch.setattr(module, '_TOKEN_STORE_PATH', self.tokens)
++            monkeypatch.setattr(module, 'AGENT_PROVIDER_PUB_PATH', public)
++        monkeypatch.setattr(self.api.cp, 'TEMP_DB', directory)
++        monkeypatch.setattr(
++            self.api.cp, '_CONSUMED_MANDATES_PATH', self.mandates
++        )
++        monkeypatch.setattr(
++            self.api.mpp, '_CONSUMED_TRANSACTIONS_PATH', self.transactions
++        )
++        monkeypatch.setattr(
++            self.api.mpp, 'MERCHANT_PAYMENT_PROCESSOR_KEY_PATH', processor_key
++        )
++        monkeypatch.setattr(
++            self.api.mpp,
++            'MERCHANT_PAYMENT_PROCESSOR_PUB_PATH',
++            directory / 'processor.pub',
++        )
++        self.install_spies(monkeypatch)
++
++    def install_spies(self, monkeypatch):
++        real_verify = self.api.MandateClient.verify
++        real_constraints = self.api.PaymentMandateChain.verify
++        real_reserve = self.api.mpp.reserve_once
++        real_receipt = self.api.ReceiptClient.create_payment_receipt
++
++        def verified(client, *args, **kwargs):
++            result = real_verify(client, *args, **kwargs)
++            self.record(
++                'signature_and_binding_verified',
++                expected_aud=kwargs.get('expected_aud'),
++                expected_nonce=kwargs.get('expected_nonce'),
++            )
++            return result
++
++        def constrained(chain, *args, **kwargs):
++            result = real_constraints(chain, *args, **kwargs)
++            self.record(
++                'constraints_checked',
++                violations=result,
++                transaction_id=chain.closed_mandate.transaction_id,
++            )
++            return result
++
++        def reserved(path, reservation_key, **kwargs):
++            try:
++                result = real_reserve(path, reservation_key, **kwargs)
++            except Exception as exc:
++                self.record(
++                    'processor_reservation',
++                    key=reservation_key,
++                    exception=type(exc).__name__,
++                )
++                raise
++            self.record(
++                'processor_reservation', key=reservation_key, reserved=result
++            )
++            return result
++
++        def created(client, *args, **kwargs):
++            result = real_receipt(client, *args, **kwargs)
++            with self.lock:
++                self.receipts.append(result.model_dump())
++            self.record(
++                'real_receipt_created',
++                payment_id=result.root.payment_id,
++                reference=result.root.reference,
++            )
++            return result
++
++        async def delivery(receipt):
++            decoded = self.api.verify_jwt(
++                receipt, JWK.from_json(self.processor.export_public())
++            )
++            self.record(
++                'signed_receipt_verified', payment_id=decoded['payment_id']
++            )
++            if self.lose_delivery:
++                self.record('delivery_lost_after_receipt_creation')
++                raise ConnectionError(
++                    'Injected lost response; caller outcome unknown'
++                )
++            self.delivered.append(decoded)
++
++        monkeypatch.setattr(self.api.MandateClient, 'verify', verified)
++        monkeypatch.setattr(self.api.PaymentMandateChain, 'verify', constrained)
++        monkeypatch.setattr(self.api.mpp, 'reserve_once', reserved)
++        monkeypatch.setattr(
++            self.api.ReceiptClient, 'create_payment_receipt', created
++        )
++        monkeypatch.setattr(
++            self.api.mpp,
++            '_send_payment_receipt_to_credentials_provider',
++            delivery,
++        )
++
++    def record(self, event, **values):
++        with self.lock:
++            self.trace.append(
++                {'attempt': ATTEMPT.get(), 'event': event, **values}
++            )
++
++    def checkout(self, identity='business-checkout-1'):
++        payload = self.api.Checkout.model_validate(
++            {
++                'id': identity,
++                'merchant': {
++                    'id': 'shop-1',
++                    'name': 'Offline merchant',
++                    'website': 'https://merchant.example',
++                },
++                'line_items': [
++                    {
++                        'id': 'line-1',
++                        'item': {
++                            'id': 'sku-1',
++                            'title': 'Offline item',
++                            'price': 2500,
++                        },
++                        'quantity': 1,
++                        'totals': [
++                            {'type': 'subtotal', 'amount': 2500},
++                            {'type': 'total', 'amount': 2500},
++                        ],
++                    }
++                ],
++                'status': 'ready_for_complete',
++                'currency': 'USD',
++                'totals': [
++                    {'type': 'subtotal', 'amount': 2500},
++                    {'type': 'total', 'amount': 2500},
++                ],
++                'links': [
++                    {
++                        'type': 'privacy_policy',
++                        'url': 'https://merchant.example/privacy',
++                    },
++                    {
++                        'type': 'terms_of_service',
++                        'url': 'https://merchant.example/terms',
++                    },
++                ],
++            }
++        ).model_dump(mode='json', exclude_none=True)
++        return self.api.create_jwt(
++            {'alg': 'ES256', 'typ': 'JWT', 'kid': self.merchant.kid},
++            payload,
++            self.merchant,
++        )
++
++    def issue(self, checkout_jwt, revision):
++        ATTEMPT.set('issuer-' + revision)
++        now = int(time.time())
++        client = self.api.MandateClient()
++        open_token = client.create(
++            [
++                self.api.OpenPaymentMandate(
++                    constraints=[
++                        self.api.AmountRange(currency='USD', max=2500),
++                        self.api.PaymentReference(
++                            conditional_transaction_id=self.open_hash
++                        ),
++                    ],
++                    cnf={'jwk': json.loads(self.agent.export_public())},
++                    iat=now,
++                    exp=now + 600,
++                    risk_data={'authorization_revision': revision},
++                )
++            ],
++            issuer_key=self.user,
++        )
++        closed = self.api.PaymentMandate(
++            transaction_id=self.api.compute_sha256_b64url(checkout_jwt),
++            payee={
++                'id': 'shop-1',
++                'name': 'Offline merchant',
++                'website': 'https://merchant.example',
++            },
++            payment_amount={'amount': 2500, 'currency': 'USD'},
++            payment_instrument={'id': 'offline-instrument', 'type': 'credit'},
++            iat=now,
++            exp=now + 600,
++            risk_data={'authorization_revision': revision},
++        )
++        nonce = 'nonce-' + revision
++        chain = client.present(
++            holder_key=self.agent,
++            mandate_token=open_token,
++            payloads=[closed],
++            aud='credential-provider',
++            nonce=nonce,
++        )
++        (self.directory / (revision + '.sdjwt')).write_text(chain)
++        result = self.api.cp.issue_payment_credential(
++            revision,
++            self.open_hash,
++            self.api.compute_sha256_b64url(checkout_jwt),
++            nonce,
++        )
++        assert 'payment_token' in result, result
++        token = result['payment_token']
++        store = json.loads(self.tokens.read_text())
++        store[token]['used'] = True
++        store[token]['order_id'] = 'merchant-order-' + revision
++        self.tokens.write_text(json.dumps(store))
++        return (
++            token,
++            self.api.compute_sha256_b64url(
++                client.get_closed_mandate_jwt(chain)
++            ),
++        )
++
++    def call(self, token, checkout, label):
++        ATTEMPT.set(label)
++        return asyncio.run(
++            self.api.mpp.initiate_payment(
++                token, self.api.compute_sha256_b64url(checkout), self.open_hash
++            )
++        )
++
++    def assert_boundary(self, label, reserved):
++        trace = [e for e in self.trace if e['attempt'] == label]
++        assert [e['event'] for e in trace[:3]] == [
++            'signature_and_binding_verified',
++            'constraints_checked',
++            'processor_reservation',
++        ], trace
++        assert trace[1]['violations'] == []
++        assert trace[2]['reserved'] is reserved
++
++    def save(self, name, **facts):
++        target = self.directory / 'results' / (name + '.json')
++        target.parent.mkdir(exist_ok=True)
++        target.write_text(
++            json.dumps(
++                {
++                    'facts': facts,
++                    'trace': self.trace,
++                    'receipts': self.receipts,
++                },
++                indent=2,
++            )
++        )
++
++
++@pytest.fixture
++def rig(monkeypatch, tmp_path):
++    logs = tmp_path / 'logs'
++    logs.mkdir()
++    monkeypatch.setenv('LOGS_DIR', str(logs))
++    monkeypatch.setenv('TEMP_DB_DIR', str(tmp_path / 'unused-default-state'))
++    original_connect = socket.socket.connect
++    monkeypatch.setattr(
++        socket.socket,
++        'connect',
++        lambda sock, address: offline_connect(original_connect, sock, address),
++    )
++    api = load_api()
++    monkeypatch.setattr(
++        api.mandate_module, 'LOG_FILE_PATH', str(logs / 'mandates.jsonl')
++    )
++    handlers = []
++    # Also isolate logging when another test imported these modules earlier.
++    for module in (api.cp, api.mpp):
++        logger = logging.Logger('offline-' + module.__name__)
++        handler = logging.FileHandler(logs / (module.__name__ + '.log'))
++        logger.addHandler(handler)
++        handlers.append(handler)
++        monkeypatch.setattr(module, '_logger', logger)
++    try:
++        yield Rig(monkeypatch, tmp_path, api)
++    finally:
++        for handler in handlers:
++            handler.close()
++
++
++def test_fresh_valid_authorization_after_unknown_same_checkout(rig):
++    checkout = rig.checkout()
++    first, reference1 = rig.issue(checkout, 'first')
++    rig.lose_delivery = True
++    with pytest.raises(ConnectionError, match='outcome unknown'):
++        rig.call(first, checkout, 'first-unknown')
++    rig.assert_boundary('first-unknown', True)
++    assert len(rig.receipts) == 1
++    before = rows(rig.transactions)
++    second, reference2 = rig.issue(checkout, 'fresh-authorization')
++    assert first != second and reference1 != reference2
++    replay = rig.call(second, checkout, 'fresh-same-checkout')
++    assert replay['error'] == 'mandate_already_used'
++    rig.assert_boundary('fresh-same-checkout', False)
++    assert len(rig.receipts) == 1 and rows(rig.transactions) == before
++
++    rig.lose_delivery = False
++    new_checkout = rig.checkout('business-checkout-2')
++    fresh, _ = rig.issue(new_checkout, 'new-checkout')
++    positive = rig.call(fresh, new_checkout, 'new-checkout')
++    rig.assert_boundary('new-checkout', True)
++    assert positive['status'] == 'success' and len(rig.receipts) == 2
++    assert len(rows(rig.transactions)) == 2
++    rig.save(
++        'unknown-same-checkout',
++        first_outcome='unknown to caller after signed receipt',
++        fresh_authorization_result='cryptographically valid; issuer minted distinct token',
++        replay=replay,
++        receipt_count_after_replay=1,
++        new_checkout_status=positive['status'],
++        final_receipt_count=2,
++        first_reference=reference1,
++        second_reference=reference2,
++    )
++
++
++@pytest.mark.parametrize('failure', ['corrupt', 'directory', 'busy'])
++def test_actual_processor_fails_closed_when_replay_state_unavailable(
++    rig, failure
++):
++    checkout = rig.checkout()
++    token, _ = rig.issue(checkout, failure)
++    lock = None
++    if failure == 'corrupt':
++        rig.transactions.write_bytes(b'not a SQLite database')
++    elif failure == 'directory':
++        rig.transactions.mkdir()
++    else:
++        assert rig.api.mpp.reserve_once(
++            rig.transactions, 'unrelated-existing-key'
++        )
++        lock = sqlite3.connect(rig.transactions, isolation_level=None)
++        lock.execute('BEGIN IMMEDIATE')
++    try:
++        result = rig.call(token, checkout, 'state-' + failure)
++    finally:
++        if lock:
++            lock.rollback()
++            lock.close()
++    assert result['error'] == 'replay_state_unavailable'
++    assert len(rig.receipts) == 0
++    trace = [e for e in rig.trace if e['attempt'] == 'state-' + failure]
++    assert trace[-1]['event'] == 'processor_reservation'
++    assert trace[-1]['exception'] == 'ReservationStoreError'
++    assert trace[-2]['violations'] == []
++    rig.save('state-' + failure, result=result, real_receipt_count=0)
++
++
++def test_eight_distinct_valid_authorizations_race_one_checkout(rig):
++    checkout = rig.checkout()
++    issued = [rig.issue(checkout, 'race-' + str(i)) for i in range(8)]
++    assert len({token for token, _ in issued}) == 8
++    assert len({reference for _, reference in issued}) == 8
++    barrier = threading.Barrier(8)
++
++    def invoke(pair):
++        i, (token, _) = pair
++        barrier.wait()
++        return rig.call(token, checkout, 'race-' + str(i))
++
++    with ThreadPoolExecutor(max_workers=8) as pool:
++        results = list(pool.map(invoke, enumerate(issued)))
++    assert sum(r.get('status') == 'success' for r in results) == 1
++    assert sum(r.get('error') == 'mandate_already_used' for r in results) == 7
++    assert len(rig.receipts) == 1 and len(rows(rig.transactions)) == 1
++    for i, result in enumerate(results):
++        rig.assert_boundary('race-' + str(i), result.get('status') == 'success')
++    rig.save(
++        'eight-fresh-authorizations',
++        results=results,
++        real_receipt_count=1,
++        verified_boundary_calls=8,
++    )
++
++
++def test_signed_checkout_reissue_is_a_distinct_hash_identity(rig):
++    first_checkout = rig.checkout('same-business-checkout')
++    # ES256 re-signing the identical validated checkout payload produces a
++    # different JWT signature. Both are legitimate merchant-signed bytes.
++    second_checkout = rig.checkout('same-business-checkout')
++    merchant_public = JWK.from_json(rig.merchant.export_public())
++    payload1 = rig.api.verify_jwt(first_checkout, merchant_public)
++    payload2 = rig.api.verify_jwt(second_checkout, merchant_public)
++    assert payload1 == payload2
++    assert first_checkout != second_checkout
++    first, _ = rig.issue(first_checkout, 'reissue-first')
++    rig.lose_delivery = True
++    with pytest.raises(ConnectionError):
++        rig.call(first, first_checkout, 'reissue-first-unknown')
++    second, _ = rig.issue(second_checkout, 'reissue-second')
++    rig.lose_delivery = False
++    result = rig.call(second, second_checkout, 'reissued-same-business-object')
++    rig.assert_boundary('reissued-same-business-object', True)
++    assert result['status'] == 'success' and len(rig.receipts) == 2
++    assert len(rows(rig.transactions)) == 2
++    rig.save(
++        'signed-checkout-reissue',
++        checkout_payloads_exactly_equal=True,
++        business_checkout_id=payload1['id'],
++        first_transaction_id=rig.api.compute_sha256_b64url(first_checkout),
++        second_transaction_id=rig.api.compute_sha256_b64url(second_checkout),
++        result=result['status'],
++        real_receipt_count=2,
++        interpretation='distinct AP2 hash-defined transaction identities; not a same-hash bypass',
++    )
++
++
++def test_processor_restart_retains_unknown_checkout_marker(rig):
++    checkout = rig.checkout()
++    first, _ = rig.issue(checkout, 'restart-first')
++    rig.lose_delivery = True
++    with pytest.raises(ConnectionError):
++        rig.call(first, checkout, 'restart-first-unknown')
++    second, _ = rig.issue(checkout, 'restart-fresh')
++    request = rig.directory / 'restart-request.json'
++    request.write_text(
++        json.dumps(
++            {
++                'directory': str(rig.directory),
++                'token': second,
++                'checkout_hash': rig.api.compute_sha256_b64url(checkout),
++                'open_hash': rig.open_hash,
++            }
++        )
++    )
++    completed = subprocess.run(
++        [
++            sys.executable,
++            '-B',
++            str(Path(__file__).resolve()),
++            '--restart-worker',
++            str(request),
++        ],
++        text=True,
++        capture_output=True,
++        check=False,
++        timeout=30,
++    )
++    assert completed.returncode == 0, completed.stderr
++    evidence = json.loads(completed.stdout)
++    assert evidence['result']['error'] == 'mandate_already_used'
++    assert evidence['receipt_count'] == 0
++    assert evidence['verification_passes'] == 1
++    assert evidence['constraint_passes'] == 1
++    assert evidence['reservation_attempts'] == [False]
++    assert len(rig.receipts) == 1 and len(rows(rig.transactions)) == 1
++    rig.save(
++        'processor-restart',
++        child=evidence,
++        original_receipt_count=1,
++        subprocess_returncode=completed.returncode,
++    )
++
++
++def restart_worker(request):
++    directory = Path(request['directory'])
++    os.environ['LOGS_DIR'] = str(directory / 'restart-logs')
++    os.environ['TEMP_DB_DIR'] = str(directory / 'restart-unused-default-state')
++    original_connect = socket.socket.connect
++    socket.socket.connect = lambda sock, address: offline_connect(
++        original_connect, sock, address
++    )
++    api = load_api()
++    api.mandate_module.LOG_FILE_PATH = str(directory / 'restart-mandates.jsonl')
++    # A new interpreter imports the real processor and reopens the exact
++    # persisted SQLite database; it does not receive the old in-memory rig.
++    evidence = {
++        'receipt_count': 0,
++        'verification_passes': 0,
++        'constraint_passes': 0,
++        'reservation_attempts': [],
++    }
++    api.mpp._TOKEN_STORE_PATH = directory / 'tokens.json'
++    api.mpp._CONSUMED_TRANSACTIONS_PATH = directory / 'transactions.sqlite3'
++    api.mpp.AGENT_PROVIDER_PUB_PATH = directory / 'authority.pub'
++    original_verify = api.MandateClient.verify
++    original_constraints = api.PaymentMandateChain.verify
++    original_reserve = api.mpp.reserve_once
++    original_receipt = api.ReceiptClient.create_payment_receipt
++
++    def verify(client, *args, **kwargs):
++        result = original_verify(client, *args, **kwargs)
++        evidence['verification_passes'] += 1
++        return result
++
++    def constraints(chain, *args, **kwargs):
++        result = original_constraints(chain, *args, **kwargs)
++        if not result:
++            evidence['constraint_passes'] += 1
++        return result
++
++    def reserve(*args, **kwargs):
++        result = original_reserve(*args, **kwargs)
++        evidence['reservation_attempts'].append(result)
++        return result
++
++    def receipt(client, *args, **kwargs):
++        evidence['receipt_count'] += 1
++        return original_receipt(client, *args, **kwargs)
++
++    async def forbidden_delivery(_receipt):
++        raise AssertionError('replay must not reach receipt delivery')
++
++    api.MandateClient.verify = verify
++    api.PaymentMandateChain.verify = constraints
++    api.mpp.reserve_once = reserve
++    api.ReceiptClient.create_payment_receipt = receipt
++    api.mpp._send_payment_receipt_to_credentials_provider = forbidden_delivery
++    evidence['result'] = asyncio.run(
++        api.mpp.initiate_payment(
++            request['token'], request['checkout_hash'], request['open_hash']
++        )
++    )
++    print(json.dumps(evidence))
++
++
++if __name__ == '__main__' and sys.argv[1:2] == ['--restart-worker']:
++    restart_worker(json.loads(Path(sys.argv[2]).read_text()))
