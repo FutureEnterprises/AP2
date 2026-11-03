@@ -1,0 +1,68 @@
+{
+  "source_repository": "https://github.com/FutureEnterprises/AP2",
+  "source_commit": "7634eac4aa479a8b42f701b13074728217dbe9e8",
+  "upstream_pr": "https://github.com/google-agentic-commerce/AP2/pull/347",
+  "source_snapshot_archive_sha256": "e139bd5be600471fcdbca2a953c9f0fe74b4c4ce61d981eb721f832147211ca7",
+  "source_snapshot_has_git_object_database": false,
+  "local_commit_created": false,
+  "identity_explanation": "Immutable public baseline pin plus exact patch SHA256; no synthetic commit presented as original Git history.",
+  "patch": {
+    "file": "ap2-unknown-outcome-all-seven.patch",
+    "sha256": "91df9d67b537c38aa4cd4b074dba64d5bc8c57ec09055b0c6d1d774ad4133346",
+    "adds_only": "code/samples/python/tests/payment_processor_unknown_outcome_tests.py"
+  },
+  "test": {
+    "file": "code/samples/python/tests/payment_processor_unknown_outcome_tests.py",
+    "sha256": "ce692846bd570d77b99ef1e2bc1e44fbc595ac0a16dc7388f1435c0637e7d611"
+  },
+  "critical_source_files_unchanged": [
+    {
+      "path": "code/samples/python/src/common/durable_reservation_store.py",
+      "bytes": 3067,
+      "sha256": "243243b0c23e69bccbc58c9e065fc86b7cb636b164d7e2cf9d02dbea29bee2ed",
+      "git_blob_sha1": "a124c452dac75e7c4e8f506a6b2fa8eeb012c742"
+    },
+    {
+      "path": "code/samples/python/src/roles/credentials_provider_mcp/server.py",
+      "bytes": 11966,
+      "sha256": "1d510451c07f3c4f360b0deb71f0ac319d4085fcca6883a55331c54f70631045",
+      "git_blob_sha1": "5f8f72061b68b2047ad19a690c47c119169cfaed"
+    },
+    {
+      "path": "code/samples/python/src/roles/merchant_payment_processor_mcp/server.py",
+      "bytes": 11118,
+      "sha256": "3963ba6cf8c12a658cf37f336ae6af1a36e77544165ecc3ba39198b1ce40c4a4",
+      "git_blob_sha1": "e2081a48805516375b1bbe79789b05a673c1d848"
+    },
+    {
+      "path": "code/sdk/python/ap2/sdk/mandate.py",
+      "bytes": 15226,
+      "sha256": "6251ec83622192805cd3cd8a4830f9ab922260c3089d4ff9323b9eb2ec27b1f5",
+      "git_blob_sha1": "30d9d7a005f41811a5750e685c106325b4a903dc"
+    },
+    {
+      "path": "code/sdk/python/ap2/sdk/payment_mandate_chain.py",
+      "bytes": 3154,
+      "sha256": "77015620be81d73a9234e9c7cdc6fbd2a3ff6dad49221303ee6a47f0fa8eb755",
+      "git_blob_sha1": "eec04a65c2915abfd0374064afa2ed08344bdf32"
+    },
+    {
+      "path": "code/sdk/python/ap2/sdk/receipt_wrapper.py",
+      "bytes": 5459,
+      "sha256": "7485ef84a7f80da5b8da39d547b9623125d43a373767ede97274cc480a70cb80",
+      "git_blob_sha1": "3927bd97bc431e2656eebaf7d54df143ddf97722"
+    },
+    {
+      "path": "code/sdk/python/ap2/sdk/jwt_helper.py",
+      "bytes": 1225,
+      "sha256": "09f21ae7f5eb9bce869f63f188064adcc5570be612a36a076a185d77f2f6d264",
+      "git_blob_sha1": "d2dbd4ca7b0bb768d1c6c370ecaa1f34208efc76"
+    }
+  ],
+  "previous_case_provenance": "Repackages the seven prior signed-chain controls; no previous private path, source keys or production data retained.",
+  "contribution_rules_read": [
+    "CONTRIBUTING.md",
+    ".ruff.toml"
+  ],
+  "publication_authorization": "Not given; packet is local review material only."
+}
