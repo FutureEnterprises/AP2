@@ -1,0 +1,80 @@
+{
+  "baseline_commit": "7634eac4aa479a8b42f701b13074728217dbe9e8",
+  "status": "local-only proposal; not published",
+  "environment": {
+    "python": "3.12.14",
+    "platform": "macOS26.6 arm64",
+    "sqlite": "3.53.1",
+    "ruff": "0.17.3"
+  },
+  "runs": {
+    "portable_file_against_pinned_source": {
+      "pass": 7,
+      "fail": 0,
+      "seconds": 6.83
+    },
+    "patch_applied_to_separate_checkout_copy": {
+      "pass": 7,
+      "fail": 0,
+      "seconds": 6.89
+    },
+    "patch_apply_check": "pass",
+    "ruff_check": "pass",
+    "ruff_format_check": "pass"
+  },
+  "cases": [
+    {
+      "case": "fixed checkout JWT, unknown receipt delivery, fresh valid authorization",
+      "expected": "mandate_already_used; one receipt after replacement; fresh different checkout succeeds",
+      "pass": true
+    },
+    {
+      "case": "corrupt replay database",
+      "expected": "replay_state_unavailable before receipt",
+      "pass": true
+    },
+    {
+      "case": "directory instead of replay database",
+      "expected": "replay_state_unavailable before receipt",
+      "pass": true
+    },
+    {
+      "case": "busy replay database",
+      "expected": "replay_state_unavailable after actual timeout, before receipt",
+      "pass": true
+    },
+    {
+      "case": "eight fresh authorizations race one checkout JWT",
+      "expected": "one receipt and key; seven mandate_already_used refusals",
+      "pass": true
+    },
+    {
+      "case": "re-signing equal validated checkout payload",
+      "expected": "distinct JWT hashes; two sample receipts and SQLite keys; distinct hash identities, not same-hash bypass",
+      "pass": true
+    },
+    {
+      "case": "new interpreter retains unknown checkout marker",
+      "expected": "valid chain reaches reserve false; zero new receipts",
+      "pass": true
+    }
+  ],
+  "case_count_note": "These are portable reruns of the same seven earlier controls, not14 distinct cases; three state parameters count separately. Four proposed occurrence-policy cases are not implemented or claimed.",
+  "substitutions": [
+    "Test-owned generated keys, files, logging and in-memory traces.",
+    "Local merchant used-token/order handoff.",
+    "Local signed-receipt verification/delivery loss seam; real SDK verifiers, constraint checks, hash, SQLite and signed receipt creation execute."
+  ],
+  "limits": [
+    "No payment network, bank, PSP, live merchant agent or real charge.",
+    "No multihost, power-loss, rollback, preserved-database deletion safety or full provider reconciliation proof.",
+    "No occurrence-identity implementation, protocol/SDK/application change or production-readiness claim."
+  ],
+  "external_actions": {
+    "email_sent": false,
+    "public_results_posted": false,
+    "pr_opened": false,
+    "branch_pushed": false,
+    "cla_signed": false
+  }
+}
